@@ -1,0 +1,14 @@
+[package]
+name = "mol-vr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mol-core = { path = "../mol-core" }
+openxr = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+bytemuck = { workspace = true }
+egui = { workspace = true }

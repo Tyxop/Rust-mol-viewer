@@ -1,0 +1,13 @@
+[package]
+name = "pdb-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom = { workspace = true }
+glam = { workspace = true }
+thiserror = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

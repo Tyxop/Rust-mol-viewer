@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Logs
+*.log
+
+# Editor backups
+*~
+.#*
+\#*#
+
+# VR/Testing
+*.mp4
+*.png
+screenshots/

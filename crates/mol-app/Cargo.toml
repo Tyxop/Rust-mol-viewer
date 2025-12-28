@@ -1,0 +1,27 @@
+[package]
+name = "mol-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pdbvisual"
+path = "src/main.rs"
+
+[dependencies]
+pdb-parser = { path = "../pdb-parser" }
+mol-render = { path = "../mol-render" }
+mol-ui = { path = "../mol-ui" }
+mol-core = { path = "../mol-core" }
+mol-vr = { path = "../mol-vr" }
+
+winit = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+pollster = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "mol-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pdb-parser = { path = "../pdb-parser" }
+mol-core = { path = "../mol-core" }
+mol-vr = { path = "../mol-vr" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
