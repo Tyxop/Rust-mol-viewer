@@ -38,6 +38,9 @@ struct App {
     // ── VR floating menu ─────────────────────────────────────────────────
     vr_menu_visible: bool,
     vr_prev_left_grip: bool,
+    /// World-space (stage, meters) center of the floating menu quad.
+    /// Updated each frame from left controller pose so the menu follows the hand.
+    vr_menu_world_pos: glam::Vec3,
     /// UV coordinates (0-1) where the right controller ray hits the menu quad.
     vr_menu_pointer_uv: Option<glam::Vec2>,
     /// True for one frame when right trigger crosses 0.8 threshold.
@@ -91,6 +94,7 @@ impl App {
             vr_mol_scale: 0.002,
             vr_menu_visible: false,
             vr_prev_left_grip: false,
+            vr_menu_world_pos: glam::Vec3::new(0.0, 1.2, -0.5),
             vr_menu_pointer_uv: None,
             vr_menu_trigger_click: false,
             vr_prev_trigger: 0.0,
@@ -1055,6 +1059,11 @@ impl ApplicationHandler for App {
                                         self.vr_mol_position.x += cs.left_joystick.x * 0.5 * dt;
                                     }
 
+                                    // Track left controller position for menu placement
+                                    // Menu hovers 0.25 m above the left palm, facing the user
+                                    self.vr_menu_world_pos = cs.left_pose.position
+                                        + glam::Vec3::new(0.0, 0.25, 0.0);
+
                                     // Left grip (edge) → toggle floating menu
                                     let left_grip = cs.left_grip_pressed;
                                     if left_grip && !self.vr_prev_left_grip {
@@ -1073,9 +1082,9 @@ impl ApplicationHandler for App {
                                         use glam::Vec3;
                                         let ray_origin = cs.right_pose.position;
                                         let ray_dir = mol_vr::VrInput::get_controller_forward(&cs.right_pose);
-                                        // Menu quad: center at (0, 1.4, -0.8), facing user (+Z), 0.6×0.3 m
-                                        let menu_center = Vec3::new(0.0, 1.4, -0.8);
-                                        let menu_normal = Vec3::new(0.0, 0.0, 1.0); // faces +Z (toward user)
+                                        // Menu quad follows left controller; normal faces roughly toward origin (+Z in stage)
+                                        let menu_center = self.vr_menu_world_pos;
+                                        let menu_normal = Vec3::new(0.0, 0.0, 1.0);
                                         let denom = menu_normal.dot(ray_dir);
                                         if denom.abs() > 0.001 {
                                             let t = menu_normal.dot(menu_center - ray_origin) / denom;
@@ -1176,12 +1185,13 @@ impl ApplicationHandler for App {
                                             // Scale: 1 Å = 2 mm (0.002 m), molecule placed 1.5 m ahead at 1.4 m height.
                                             // This properly tracks head rotation and translation.
                                             // ── mol_to_world from controller-driven state ──────
+                                            // Hoisted here so it's also available for the menu transform below.
+                                            let mol_to_world = glam::Mat4::from_scale_rotation_translation(
+                                                glam::Vec3::splat(self.vr_mol_scale),
+                                                self.vr_mol_rotation,
+                                                self.vr_mol_position,
+                                            );
                                             if let Ok(views) = vr.vr_session.get_view_configs() {
-                                                let mol_to_world = glam::Mat4::from_scale_rotation_translation(
-                                                    glam::Vec3::splat(self.vr_mol_scale),
-                                                    self.vr_mol_rotation,
-                                                    self.vr_mol_position,
-                                                );
                                                 let left_uniform = mol_render::vr_renderer::VrRenderer::build_eye_uniform(
                                                     &views[0], 0.02, 100.0, mol_to_world,
                                                 );
@@ -1308,13 +1318,17 @@ impl ApplicationHandler for App {
                                                     }
                                                     renderer.queue.submit(std::iter::once(menu_enc.finish()));
 
-                                                    // Upload menu quad transform to GPU
-                                                    let menu_world = glam::Mat4::from_scale_rotation_translation(
+                                                    // Upload menu quad transform to GPU.
+                                                    // The menu is in stage space (meters). The shader uses
+                                                    // camera.view_proj = proj * eye_from_world * mol_to_world,
+                                                    // so we pre-multiply by mol_to_world.inverse() to cancel
+                                                    // the mol_to_world and render in true stage-space coords.
+                                                    let menu_stage = glam::Mat4::from_scale_rotation_translation(
                                                         glam::Vec3::new(0.6, 0.3, 1.0), // 60 cm × 30 cm
                                                         glam::Quat::IDENTITY,
-                                                        glam::Vec3::new(0.0, 1.4, -0.8),
+                                                        self.vr_menu_world_pos,
                                                     );
-                                                    vr.update_menu_transform(&renderer.queue, menu_world);
+                                                    vr.update_menu_transform(&renderer.queue, mol_to_world.inverse() * menu_stage);
 
                                                     for id in &full_out.textures_delta.free {
                                                         menu_rdr.free_texture(id);
