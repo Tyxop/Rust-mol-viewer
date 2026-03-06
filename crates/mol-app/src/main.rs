@@ -1427,8 +1427,11 @@ impl ApplicationHandler for App {
                                                         occlusion_query_set: None,
                                                     });
                                                     pass.set_bind_group(0, &vr.left_camera_bind_group, &[]);
-                                                    if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
-                                                        vr_sph.render(&mut pass);
+                                                    match renderer.representation {
+                                                        RepresentationType::BallAndStick => { if let Some(ref r) = renderer.vr_ball_stick_renderer { r.render(&mut pass); } }
+                                                        RepresentationType::Ribbon       => { if let Some(ref r) = renderer.vr_ribbon_renderer       { r.render(&mut pass); } }
+                                                        RepresentationType::Surface      => { if let Some(ref r) = renderer.vr_surface_renderer      { r.render(&mut pass); } }
+                                                        _                                => { if let Some(ref r) = renderer.vr_spheres_renderer       { r.render(&mut pass); } }
                                                     }
                                                     vr.render_controllers(&mut pass, &vr.left_camera_bind_group);
                                                     if menu_vis { vr.render_menu_quad(&mut pass, &vr.left_camera_bind_group); }
@@ -1456,8 +1459,11 @@ impl ApplicationHandler for App {
                                                         occlusion_query_set: None,
                                                     });
                                                     pass.set_bind_group(0, &vr.right_camera_bind_group, &[]);
-                                                    if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
-                                                        vr_sph.render(&mut pass);
+                                                    match renderer.representation {
+                                                        RepresentationType::BallAndStick => { if let Some(ref r) = renderer.vr_ball_stick_renderer { r.render(&mut pass); } }
+                                                        RepresentationType::Ribbon       => { if let Some(ref r) = renderer.vr_ribbon_renderer       { r.render(&mut pass); } }
+                                                        RepresentationType::Surface      => { if let Some(ref r) = renderer.vr_surface_renderer      { r.render(&mut pass); } }
+                                                        _                                => { if let Some(ref r) = renderer.vr_spheres_renderer       { r.render(&mut pass); } }
                                                     }
                                                     vr.render_controllers(&mut pass, &vr.right_camera_bind_group);
                                                     if menu_vis { vr.render_menu_quad(&mut pass, &vr.right_camera_bind_group); }

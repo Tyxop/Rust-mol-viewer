@@ -104,8 +104,12 @@ pub struct Renderer {
     gpu_spheres_low: Option<SpheresRenderer>,
     gpu_spheres_very_low: Option<SpheresRenderer>,
 
-    // VR sphere renderer compiled with the VR swapchain format (Rgba8UnormSrgb)
+    // VR renderers compiled with the VR swapchain format (Rgba8UnormSrgb).
+    // Each mirrors its desktop counterpart but targets the correct swapchain format.
     pub vr_spheres_renderer: Option<SpheresRenderer>,
+    pub vr_ribbon_renderer: Option<RibbonRenderer>,
+    pub vr_ball_stick_renderer: Option<BallStickRenderer>,
+    pub vr_surface_renderer: Option<SurfaceRenderer>,
 
     // LOD and culling systems
     lod_system: LodSystem,
@@ -480,7 +484,10 @@ impl Renderer {
             benchmark_stats: BenchmarkStats::new(),
 
             vr_renderer: None, // initialized below if vr_mode
-            vr_spheres_renderer: None, // initialized below if vr_mode
+            vr_spheres_renderer: None,
+            vr_ribbon_renderer: None,
+            vr_ball_stick_renderer: None,
+            vr_surface_renderer: None,
         };
 
         // Initialize VR renderer now that the camera bind group layout is stored in the struct
@@ -497,6 +504,21 @@ impl Renderer {
                     // Using the wrong format causes a pipeline validation error at render time.
                     let vr_fmt = vr.swapchain_format;
                     renderer.vr_spheres_renderer = Some(SpheresRenderer::new(
+                        &renderer.device,
+                        vr_fmt,
+                        &renderer.camera_bind_group_layout,
+                    ));
+                    renderer.vr_ribbon_renderer = Some(RibbonRenderer::new(
+                        &renderer.device,
+                        vr_fmt,
+                        &renderer.camera_bind_group_layout,
+                    ));
+                    renderer.vr_ball_stick_renderer = Some(BallStickRenderer::new(
+                        &renderer.device,
+                        vr_fmt,
+                        &renderer.camera_bind_group_layout,
+                    ));
+                    renderer.vr_surface_renderer = Some(SurfaceRenderer::new(
                         &renderer.device,
                         vr_fmt,
                         &renderer.camera_bind_group_layout,
@@ -1333,6 +1355,11 @@ impl Renderer {
             renderer.update_spheres(&self.queue, &ball_instances);
             renderer.update_cylinders(&self.queue, &cylinder_instances);
         }
+        // Mirror to VR ball-stick renderer
+        if let Some(ref mut vr_ball) = self.vr_ball_stick_renderer {
+            vr_ball.update_spheres(&self.queue, &ball_instances);
+            vr_ball.update_cylinders(&self.queue, &cylinder_instances);
+        }
 
         self.ball_stick_loaded = true;
         self.ball_stick_atom_count = protein.atoms.len();
@@ -1375,6 +1402,12 @@ impl Renderer {
                 log::info!("Ribbon geometry ready");
             }
         }
+        // Mirror to VR ribbon renderer (same data, different pipeline format)
+        if let Some(ref mut vr_ribbon) = self.vr_ribbon_renderer {
+            if let Err(e) = vr_ribbon.update_from_protein(&self.queue, protein) {
+                log::error!("Failed to generate VR ribbon: {}", e);
+            }
+        }
     }
 
     /// Ensure surface renderer is created and has data
@@ -1414,6 +1447,12 @@ impl Renderer {
                 self.surface_loaded = true;
                 self.surface_atom_count = protein.atoms.len();
                 log::info!("Surface geometry ready");
+            }
+        }
+        // Mirror to VR surface renderer
+        if let Some(ref mut vr_surf) = self.vr_surface_renderer {
+            if let Err(e) = vr_surf.generate_surface(&self.device, &self.queue, protein, &surface_config) {
+                log::error!("Failed to generate VR surface: {}", e);
             }
         }
     }
