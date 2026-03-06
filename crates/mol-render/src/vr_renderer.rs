@@ -4,12 +4,33 @@
 //! integrating OpenXR session management with the main wgpu renderer.
 
 use crate::camera::{Camera, Eye};
+use crate::geometry::{create_icosphere, Vertex};
 use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3, Vec4};
 use log::{info, warn};
 use mol_vr::{openxr, VrPerformanceMonitor, VrSession};
 use wgpu;
 use wgpu::util::DeviceExt;
+
+/// GPU-side uniform for a single controller sphere (model matrix + colour).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CtrlUniform {
+    model: [[f32; 4]; 4],
+    color: [f32; 4],
+}
+
+/// Temporary bundle used while constructing controller sphere resources.
+struct CtrlResources {
+    pipeline: wgpu::RenderPipeline,
+    vb: wgpu::Buffer,
+    ib: wgpu::Buffer,
+    index_count: u32,
+    left_buffer: wgpu::Buffer,
+    right_buffer: wgpu::Buffer,
+    left_bg: wgpu::BindGroup,
+    right_bg: wgpu::BindGroup,
+}
 
 /// Temporary bundle used while constructing the menu panel resources.
 struct MenuResources {
@@ -57,6 +78,16 @@ pub struct VrRenderer {
     /// GPU buffer for the 4×4 world-space transform of the menu quad.
     pub vr_menu_transform_buffer: wgpu::Buffer,
     vr_menu_bind_group: wgpu::BindGroup,
+
+    // ── Controller sphere visualisation ──────────────────────────────────
+    ctrl_pipeline: wgpu::RenderPipeline,
+    ctrl_vb: wgpu::Buffer,
+    ctrl_ib: wgpu::Buffer,
+    ctrl_index_count: u32,
+    pub ctrl_left_buffer: wgpu::Buffer,   // CtrlUniform (model + color) for left  controller
+    pub ctrl_right_buffer: wgpu::Buffer,  // CtrlUniform (model + color) for right controller
+    ctrl_left_bg: wgpu::BindGroup,
+    ctrl_right_bg: wgpu::BindGroup,
 }
 
 impl VrRenderer {
@@ -145,6 +176,9 @@ impl VrRenderer {
         // ── Build floating menu panel resources ───────────────────────────
         let menu = Self::create_menu_resources(device, camera_bind_group_layout, swapchain_format);
 
+        // ── Build controller sphere resources ─────────────────────────────
+        let ctrl = Self::create_controller_resources(device, camera_bind_group_layout, swapchain_format);
+
         Ok(Self {
             vr_session,
             swapchain_format,
@@ -165,7 +199,166 @@ impl VrRenderer {
             vr_menu_index_buffer: menu.index_buffer,
             vr_menu_transform_buffer: menu.transform_buffer,
             vr_menu_bind_group: menu.bind_group,
+            ctrl_pipeline: ctrl.pipeline,
+            ctrl_vb: ctrl.vb,
+            ctrl_ib: ctrl.ib,
+            ctrl_index_count: ctrl.index_count,
+            ctrl_left_buffer: ctrl.left_buffer,
+            ctrl_right_buffer: ctrl.right_buffer,
+            ctrl_left_bg: ctrl.left_bg,
+            ctrl_right_bg: ctrl.right_bg,
         })
+    }
+
+    // ── Controller sphere creation ────────────────────────────────────────
+
+    fn create_controller_resources(
+        device: &wgpu::Device,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        swapchain_format: wgpu::TextureFormat,
+    ) -> CtrlResources {
+        // Low-poly icosphere (subdivision 1) — plenty for a 3 cm marker
+        let mesh = create_icosphere(1);
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Ctrl Sphere VB"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Ctrl Sphere IB"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let index_count = mesh.indices.len() as u32;
+
+        // Bind group layout for per-controller data (model + color)
+        let ctrl_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Ctrl Sphere BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let make_buf = |color: [f32; 4]| -> wgpu::Buffer {
+            let u = CtrlUniform { model: Mat4::IDENTITY.to_cols_array_2d(), color };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Ctrl Uniform"),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        // Left = blue, Right = red
+        let left_buffer  = make_buf([0.2, 0.4, 1.0, 1.0]);
+        let right_buffer = make_buf([1.0, 0.2, 0.2, 1.0]);
+
+        let make_bg = |buf: &wgpu::Buffer| -> wgpu::BindGroup {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Ctrl Sphere BG"),
+                layout: &ctrl_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                }],
+            })
+        };
+        let left_bg  = make_bg(&left_buffer);
+        let right_bg = make_bg(&right_buffer);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ctrl Sphere Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/controller_sphere.wgsl").into(),
+            ),
+        });
+
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Ctrl Sphere Layout"),
+            bind_group_layouts: &[camera_bind_group_layout, &ctrl_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Ctrl Sphere Pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: swapchain_format,
+                    blend: None, // opaque
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        CtrlResources { pipeline, vb, ib, index_count, left_buffer, right_buffer, left_bg, right_bg }
+    }
+
+    /// Upload per-frame controller transforms (mol-space, i.e. pre-multiplied by mol_to_world⁻¹).
+    /// Call once per frame after computing mol_to_world.
+    pub fn update_controller_transforms(
+        &self,
+        queue: &wgpu::Queue,
+        left_model: Mat4,
+        right_model: Mat4,
+    ) {
+        let left_u = CtrlUniform {
+            model: left_model.to_cols_array_2d(),
+            color: [0.2, 0.4, 1.0, 1.0], // blue
+        };
+        let right_u = CtrlUniform {
+            model: right_model.to_cols_array_2d(),
+            color: [1.0, 0.2, 0.2, 1.0], // red
+        };
+        queue.write_buffer(&self.ctrl_left_buffer,  0, bytemuck::cast_slice(&[left_u]));
+        queue.write_buffer(&self.ctrl_right_buffer, 0, bytemuck::cast_slice(&[right_u]));
+    }
+
+    /// Render both controller spheres into a VR eye render pass.
+    pub fn render_controllers<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera_bg: &'a wgpu::BindGroup,
+    ) {
+        pass.set_pipeline(&self.ctrl_pipeline);
+        pass.set_vertex_buffer(0, self.ctrl_vb.slice(..));
+        pass.set_index_buffer(self.ctrl_ib.slice(..), wgpu::IndexFormat::Uint32);
+        // Left controller (blue)
+        pass.set_bind_group(0, camera_bg, &[]);
+        pass.set_bind_group(1, &self.ctrl_left_bg, &[]);
+        pass.draw_indexed(0..self.ctrl_index_count, 0, 0..1);
+        // Right controller (red)
+        pass.set_bind_group(1, &self.ctrl_right_bg, &[]);
+        pass.draw_indexed(0..self.ctrl_index_count, 0, 0..1);
     }
 
     // ── Menu panel creation ───────────────────────────────────────────────

@@ -51,6 +51,12 @@ struct App {
     /// egui_wgpu renderer targeting the menu texture (Rgba8UnormSrgb, no depth).
     vr_egui_renderer: Option<egui_wgpu::Renderer>,
 
+    // ── VR controller / head tracking (updated from OpenXR each frame) ───
+    vr_left_ctrl_pos: glam::Vec3,
+    vr_right_ctrl_pos: glam::Vec3,
+    /// Head centre (average of both eye positions) in stage space (meters).
+    vr_head_pos: glam::Vec3,
+
     // VR input state (for edge detection)
     prev_right_grip: bool,
 
@@ -100,6 +106,9 @@ impl App {
             vr_prev_trigger: 0.0,
             vr_egui_ctx: egui::Context::default(),
             vr_egui_renderer: None,
+            vr_left_ctrl_pos: glam::Vec3::new(-0.3, 1.0, -0.3),
+            vr_right_ctrl_pos: glam::Vec3::new(0.3, 1.0, -0.3),
+            vr_head_pos: glam::Vec3::new(0.0, 1.6, 0.0),
             prev_right_grip: false,
             last_frame_time: Instant::now(),
             frame_accumulator: 0.0,
@@ -1059,10 +1068,11 @@ impl ApplicationHandler for App {
                                         self.vr_mol_position.x += cs.left_joystick.x * 0.5 * dt;
                                     }
 
-                                    // Track left controller position for menu placement
-                                    // Menu hovers 0.25 m above the left palm, facing the user
-                                    self.vr_menu_world_pos = cs.left_pose.position
-                                        + glam::Vec3::new(0.0, 0.25, 0.0);
+                                    // Store controller poses for sphere rendering & menu placement
+                                    self.vr_left_ctrl_pos  = cs.left_pose.position;
+                                    self.vr_right_ctrl_pos = cs.right_pose.position;
+                                    // Menu appears at left controller position (updated below from views for billboarding)
+                                    self.vr_menu_world_pos = cs.left_pose.position;
 
                                     // Left grip (edge) → toggle floating menu
                                     let left_grip = cs.left_grip_pressed;
@@ -1192,6 +1202,9 @@ impl ApplicationHandler for App {
                                                 self.vr_mol_position,
                                             );
                                             if let Ok(views) = vr.vr_session.get_view_configs() {
+                                                // Track head position for menu billboarding
+                                                self.vr_head_pos = (views[0].position + views[1].position) * 0.5;
+
                                                 let left_uniform = mol_render::vr_renderer::VrRenderer::build_eye_uniform(
                                                     &views[0], 0.02, 100.0, mol_to_world,
                                                 );
@@ -1200,6 +1213,21 @@ impl ApplicationHandler for App {
                                                 );
                                                 renderer.queue.write_buffer(&vr.left_camera_buffer, 0, bytemuck::cast_slice(&[left_uniform]));
                                                 renderer.queue.write_buffer(&vr.right_camera_buffer, 0, bytemuck::cast_slice(&[right_uniform]));
+                                            }
+
+                                            // ── Controller sphere transforms ──────────────────
+                                            // Sphere radius = 3 cm in stage space.
+                                            // Pre-multiply by mol_to_world.inverse() so the shader's
+                                            // view_proj (which includes mol_to_world) cancels out.
+                                            {
+                                                let r = 0.03f32; // 3 cm radius
+                                                let left_stage  = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(r), glam::Quat::IDENTITY, self.vr_left_ctrl_pos);
+                                                let right_stage = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(r), glam::Quat::IDENTITY, self.vr_right_ctrl_pos);
+                                                vr.update_controller_transforms(
+                                                    &renderer.queue,
+                                                    mol_to_world.inverse() * left_stage,
+                                                    mol_to_world.inverse() * right_stage,
+                                                );
                                             }
 
                                             // ── Render egui menu to texture (before eye passes) ─
@@ -1318,15 +1346,23 @@ impl ApplicationHandler for App {
                                                     }
                                                     renderer.queue.submit(std::iter::once(menu_enc.finish()));
 
-                                                    // Upload menu quad transform to GPU.
-                                                    // The menu is in stage space (meters). The shader uses
-                                                    // camera.view_proj = proj * eye_from_world * mol_to_world,
-                                                    // so we pre-multiply by mol_to_world.inverse() to cancel
-                                                    // the mol_to_world and render in true stage-space coords.
+                                                    // ── Billboard menu toward user's head ────────
+                                                    // Compute rotation so the menu quad always faces the user.
+                                                    let menu_pos = self.vr_menu_world_pos;
+                                                    let to_head  = (self.vr_head_pos - menu_pos).normalize();
+                                                    // Menu local +Z should point toward the head.
+                                                    let menu_rot = if to_head.length_squared() > 0.0001 {
+                                                        glam::Quat::from_rotation_arc(glam::Vec3::Z, to_head)
+                                                    } else {
+                                                        glam::Quat::IDENTITY
+                                                    };
+                                                    // 60 cm × 30 cm panel in stage space.
+                                                    // Pre-multiply by mol_to_world.inverse() so the shader's
+                                                    // view_proj (= proj * eye_from_world * mol_to_world) cancels.
                                                     let menu_stage = glam::Mat4::from_scale_rotation_translation(
-                                                        glam::Vec3::new(0.6, 0.3, 1.0), // 60 cm × 30 cm
-                                                        glam::Quat::IDENTITY,
-                                                        self.vr_menu_world_pos,
+                                                        glam::Vec3::new(0.6, 0.3, 1.0),
+                                                        menu_rot,
+                                                        menu_pos,
                                                     );
                                                     vr.update_menu_transform(&renderer.queue, mol_to_world.inverse() * menu_stage);
 
@@ -1374,6 +1410,7 @@ impl ApplicationHandler for App {
                                                     if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
                                                         vr_sph.render(&mut pass);
                                                     }
+                                                    vr.render_controllers(&mut pass, &vr.left_camera_bind_group);
                                                     if menu_vis { vr.render_menu_quad(&mut pass, &vr.left_camera_bind_group); }
                                                 }
 
@@ -1402,6 +1439,7 @@ impl ApplicationHandler for App {
                                                     if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
                                                         vr_sph.render(&mut pass);
                                                     }
+                                                    vr.render_controllers(&mut pass, &vr.right_camera_bind_group);
                                                     if menu_vis { vr.render_menu_quad(&mut pass, &vr.right_camera_bind_group); }
                                                 }
 
