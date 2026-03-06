@@ -1319,14 +1319,17 @@ impl ApplicationHandler for App {
                                                             RepresentationType::Surface => UIRepType::Surface,
                                                             _ => UIRepType::VanDerWaals,
                                                         };
-                                                        // The desktop render loop reads model.representation each frame
-                                                        // and overwrites renderer.representation, so we must update both.
                                                         renderer.representation = rt;
                                                         self.ui_state.representation = ui_rt;
-                                                        self.ui_state.representation_changed = true;
+                                                        // Line ~852 runs every frame and overwrites model.representation
+                                                        // from ui_state.models[i].representation — must sync all three.
+                                                        for model_info in &mut self.ui_state.models {
+                                                            model_info.representation = ui_rt;
+                                                        }
                                                         for model in self.model_manager.all_models_mut() {
                                                             model.representation = rt;
                                                         }
+                                                        self.ui_state.representation_changed = true;
                                                     }
                                                     if do_reset {
                                                         self.vr_mol_position = glam::Vec3::new(0.0, 1.4, -1.5);
