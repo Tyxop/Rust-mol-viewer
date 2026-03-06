@@ -26,6 +26,28 @@ struct App {
 
     // VR mode flag
     vr_mode: bool,
+
+    // ── VR molecule world transform (modified by controller input) ────────
+    /// Molecule center in OpenXR stage space (meters). Default: 1.5 m ahead, 1.4 m up.
+    vr_mol_position: glam::Vec3,
+    /// Molecule orientation in stage space. Default: identity (Y-up).
+    vr_mol_rotation: glam::Quat,
+    /// Scale factor: metres per Ångström. Default 0.002 (1 Å → 2 mm, ~58 cm protein).
+    vr_mol_scale: f32,
+
+    // ── VR floating menu ─────────────────────────────────────────────────
+    vr_menu_visible: bool,
+    vr_prev_left_grip: bool,
+    /// UV coordinates (0-1) where the right controller ray hits the menu quad.
+    vr_menu_pointer_uv: Option<glam::Vec2>,
+    /// True for one frame when right trigger crosses 0.8 threshold.
+    vr_menu_trigger_click: bool,
+    vr_prev_trigger: f32,
+    /// egui context used exclusively for the VR floating menu.
+    vr_egui_ctx: egui::Context,
+    /// egui_wgpu renderer targeting the menu texture (Rgba8UnormSrgb, no depth).
+    vr_egui_renderer: Option<egui_wgpu::Renderer>,
+
     // VR input state (for edge detection)
     prev_right_grip: bool,
 
@@ -64,6 +86,16 @@ impl App {
             last_loaded_model_id: None,
             protein_path,
             vr_mode,
+            vr_mol_position: glam::Vec3::new(0.0, 1.4, -1.5),
+            vr_mol_rotation: glam::Quat::IDENTITY,
+            vr_mol_scale: 0.002,
+            vr_menu_visible: false,
+            vr_prev_left_grip: false,
+            vr_menu_pointer_uv: None,
+            vr_menu_trigger_click: false,
+            vr_prev_trigger: 0.0,
+            vr_egui_ctx: egui::Context::default(),
+            vr_egui_renderer: None,
             prev_right_grip: false,
             last_frame_time: Instant::now(),
             frame_accumulator: 0.0,
@@ -581,6 +613,19 @@ impl ApplicationHandler for App {
             self.egui_ctx = Some(egui_ctx);
             self.egui_state = Some(egui_state);
             self.egui_renderer = Some(egui_renderer);
+
+            // VR-only: create a second egui renderer targeting the menu texture format
+            if self.vr_mode {
+                let vr_menu_renderer = egui_wgpu::Renderer::new(
+                    &renderer.device,
+                    wgpu::TextureFormat::Rgba8UnormSrgb, // matches vr_menu_texture
+                    None,
+                    1,
+                    false,
+                );
+                self.vr_egui_renderer = Some(vr_menu_renderer);
+            }
+
             self.renderer = Some(renderer);
             self.window = Some(window);
         }
@@ -976,47 +1021,85 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Update VR controls (joystick, teleport) before camera update
+                    // ── VR Controller Input ──────────────────────────────────────────────
+                    // Joysticks rotate/scale the molecule transform (mol_to_world).
+                    // Left grip toggles the floating menu.
+                    // Right grip picks atoms.
                     let mut vr_grip_selection: Option<mol_vr::Pose> = None;
 
                     if self.vr_mode {
-                        let delta_time = self.fps_counter.frame_time_ms() / 1000.0; // Convert ms to seconds
+                        let dt = (self.fps_counter.frame_time_ms() / 1000.0).clamp(0.001, 0.1);
 
-                        // Get VR renderer if available
                         if let Some(vr_renderer) = &mut renderer.vr_renderer {
-                            // Sync input actions
                             if let Ok(()) = vr_renderer.vr_session.input.sync(&vr_renderer.vr_session.session) {
-                                // Get controller state
-                                if let Ok(controller_state) = vr_renderer.vr_session.input.get_controller_state(
+                                if let Ok(cs) = vr_renderer.vr_session.input.get_controller_state(
                                     &vr_renderer.vr_session.session,
                                     &vr_renderer.vr_session.stage_space,
-                                    openxr::Time::from_nanos(0), // TODO: Use actual predicted display time
+                                    openxr::Time::from_nanos(0),
                                 ) {
-                                    // Right joystick: Rotate molecule around target
-                                    if controller_state.right_joystick.length() > 0.1 {
-                                        renderer.camera.apply_vr_rotation(controller_state.right_joystick, delta_time);
+                                    // Right joystick → rotate molecule (Y axis = yaw, X axis = pitch)
+                                    if cs.right_joystick.length() > 0.1 {
+                                        let yaw   = glam::Quat::from_rotation_y(-cs.right_joystick.x * 2.0 * dt);
+                                        let pitch = glam::Quat::from_rotation_x( cs.right_joystick.y * 2.0 * dt);
+                                        self.vr_mol_rotation = yaw * pitch * self.vr_mol_rotation;
                                     }
 
-                                    // Left joystick: Move camera position
-                                    if controller_state.left_joystick.length() > 0.1 {
-                                        renderer.camera.apply_vr_movement(controller_state.left_joystick, delta_time);
+                                    // Left joystick Y → zoom (scale)
+                                    if cs.left_joystick.y.abs() > 0.1 {
+                                        let factor = 1.0 + cs.left_joystick.y * 1.5 * dt;
+                                        self.vr_mol_scale = (self.vr_mol_scale * factor).clamp(0.0003, 0.05);
                                     }
 
-                                    // Teleport with left thumbstick click
-                                    if controller_state.teleport_pressed {
-                                        let forward = mol_vr::VrInput::get_controller_forward(&controller_state.left_pose);
-                                        let teleport_distance = 50.0; // 50 Angstroms
-                                        renderer.camera.apply_vr_teleport(forward, teleport_distance);
-                                        log::info!("VR teleport triggered");
+                                    // Left joystick X → slide molecule left/right
+                                    if cs.left_joystick.x.abs() > 0.1 {
+                                        self.vr_mol_position.x += cs.left_joystick.x * 0.5 * dt;
                                     }
 
-                                    // Right grip: Select atom (edge trigger)
-                                    if controller_state.right_grip_pressed && !self.prev_right_grip {
-                                        vr_grip_selection = Some(controller_state.right_pose);
+                                    // Left grip (edge) → toggle floating menu
+                                    let left_grip = cs.left_grip_pressed;
+                                    if left_grip && !self.vr_prev_left_grip {
+                                        self.vr_menu_visible = !self.vr_menu_visible;
+                                        log::info!("VR menu: {}", if self.vr_menu_visible { "opened" } else { "closed" });
+                                    }
+                                    self.vr_prev_left_grip = left_grip;
+
+                                    // Right trigger (edge at 0.8) → click on menu or nothing
+                                    let trig = cs.right_trigger_value;
+                                    self.vr_menu_trigger_click = trig > 0.8 && self.vr_prev_trigger <= 0.8;
+                                    self.vr_prev_trigger = trig;
+
+                                    // Compute controller ray → menu UV intersection (right controller)
+                                    if self.vr_menu_visible {
+                                        use glam::Vec3;
+                                        let ray_origin = cs.right_pose.position;
+                                        let ray_dir = mol_vr::VrInput::get_controller_forward(&cs.right_pose);
+                                        // Menu quad: center at (0, 1.4, -0.8), facing user (+Z), 0.6×0.3 m
+                                        let menu_center = Vec3::new(0.0, 1.4, -0.8);
+                                        let menu_normal = Vec3::new(0.0, 0.0, 1.0); // faces +Z (toward user)
+                                        let denom = menu_normal.dot(ray_dir);
+                                        if denom.abs() > 0.001 {
+                                            let t = menu_normal.dot(menu_center - ray_origin) / denom;
+                                            if t > 0.0 {
+                                                let hit = ray_origin + ray_dir * t;
+                                                let local = hit - menu_center;
+                                                let u = (local.x / 0.6 + 0.5).clamp(0.0, 1.0);
+                                                let v = (0.5 - local.y / 0.3).clamp(0.0, 1.0);
+                                                self.vr_menu_pointer_uv = Some(glam::Vec2::new(u, v));
+                                            } else {
+                                                self.vr_menu_pointer_uv = None;
+                                            }
+                                        } else {
+                                            self.vr_menu_pointer_uv = None;
+                                        }
+                                    } else {
+                                        self.vr_menu_pointer_uv = None;
                                     }
 
-                                    // Update grip state for next frame
-                                    self.prev_right_grip = controller_state.right_grip_pressed;
+                                    // Right grip (edge) → pick atom when menu is closed
+                                    if cs.right_grip_pressed && !self.prev_right_grip && !self.vr_menu_visible {
+                                        vr_grip_selection = Some(cs.right_pose);
+                                    }
+                                    self.prev_right_grip = cs.right_grip_pressed;
                                 }
                             }
                         }
@@ -1092,12 +1175,12 @@ impl ApplicationHandler for App {
                                             // Build per-eye camera uniforms directly from OpenXR 6DoF poses.
                                             // Scale: 1 Å = 2 mm (0.002 m), molecule placed 1.5 m ahead at 1.4 m height.
                                             // This properly tracks head rotation and translation.
+                                            // ── mol_to_world from controller-driven state ──────
                                             if let Ok(views) = vr.vr_session.get_view_configs() {
-                                                use glam::{Mat4, Quat, Vec3};
-                                                let mol_to_world = Mat4::from_scale_rotation_translation(
-                                                    Vec3::splat(0.002),
-                                                    Quat::IDENTITY,
-                                                    Vec3::new(0.0, 1.4, -1.5),
+                                                let mol_to_world = glam::Mat4::from_scale_rotation_translation(
+                                                    glam::Vec3::splat(self.vr_mol_scale),
+                                                    self.vr_mol_rotation,
+                                                    self.vr_mol_position,
                                                 );
                                                 let left_uniform = mol_render::vr_renderer::VrRenderer::build_eye_uniform(
                                                     &views[0], 0.02, 100.0, mol_to_world,
@@ -1107,6 +1190,136 @@ impl ApplicationHandler for App {
                                                 );
                                                 renderer.queue.write_buffer(&vr.left_camera_buffer, 0, bytemuck::cast_slice(&[left_uniform]));
                                                 renderer.queue.write_buffer(&vr.right_camera_buffer, 0, bytemuck::cast_slice(&[right_uniform]));
+                                            }
+
+                                            // ── Render egui menu to texture (before eye passes) ─
+                                            if self.vr_menu_visible {
+                                                if let Some(ref mut menu_rdr) = self.vr_egui_renderer {
+                                                    let px = 2.0f32; // pixels_per_point: 2× → crisper
+                                                    let screen_w = 512u32;
+                                                    let screen_h = 256u32;
+
+                                                    // Build egui input; inject controller ray as pointer
+                                                    let mut raw = egui::RawInput {
+                                                        screen_rect: Some(egui::Rect::from_min_size(
+                                                            egui::Pos2::ZERO,
+                                                            egui::Vec2::new(screen_w as f32 / px, screen_h as f32 / px),
+                                                        )),
+                                                        ..Default::default()
+                                                    };
+                                                    self.vr_egui_ctx.set_pixels_per_point(px);
+                                                    if let Some(uv) = self.vr_menu_pointer_uv {
+                                                        let ppos = egui::Pos2::new(
+                                                            uv.x * screen_w as f32 / px,
+                                                            uv.y * screen_h as f32 / px,
+                                                        );
+                                                        raw.events.push(egui::Event::PointerMoved(ppos));
+                                                        if self.vr_menu_trigger_click {
+                                                            raw.events.push(egui::Event::PointerButton { pos: ppos, button: egui::PointerButton::Primary, pressed: true,  modifiers: Default::default() });
+                                                            raw.events.push(egui::Event::PointerButton { pos: ppos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+                                                        }
+                                                    }
+
+                                                    // Menu state captures
+                                                    let mut repr_choice: Option<RepresentationType> = None;
+                                                    let mut do_reset = false;
+                                                    let mut do_scale_up   = false;
+                                                    let mut do_scale_down = false;
+                                                    let cur_repr = renderer.representation;
+                                                    let cur_scale = self.vr_mol_scale;
+
+                                                    let full_out = self.vr_egui_ctx.run(raw, |ctx| {
+                                                        ctx.set_visuals(egui::Visuals::dark());
+                                                        egui::CentralPanel::default().show(ctx, |ui| {
+                                                            ui.heading("PDB Visual VR");
+                                                            ui.separator();
+                                                            ui.label("Representation:");
+                                                            ui.horizontal(|ui| {
+                                                                let opts = [
+                                                                    ("VdW",       RepresentationType::VanDerWaals),
+                                                                    ("Ball+Stick",RepresentationType::BallAndStick),
+                                                                    ("Ribbon",    RepresentationType::Ribbon),
+                                                                    ("Surface",   RepresentationType::Surface),
+                                                                ];
+                                                                for (label, rt) in &opts {
+                                                                    if ui.selectable_label(cur_repr == *rt, *label).clicked() {
+                                                                        repr_choice = Some(*rt);
+                                                                    }
+                                                                }
+                                                            });
+                                                            ui.separator();
+                                                            ui.horizontal(|ui| {
+                                                                if ui.button("Reset").clicked()   { do_reset = true; }
+                                                                if ui.button("Scale+").clicked()  { do_scale_up = true; }
+                                                                if ui.button("Scale-").clicked()  { do_scale_down = true; }
+                                                            });
+                                                            ui.label(format!("Scale: {:.1}%", cur_scale / 0.002 * 100.0));
+                                                            ui.separator();
+                                                            ui.small("R.Stick: Rotate  L.Stick: Zoom/Move");
+                                                            ui.small("L.Grip: Menu    R.Grip: Pick atom");
+                                                        });
+                                                    });
+
+                                                    // Apply button actions
+                                                    if let Some(rt) = repr_choice {
+                                                        self.ui_state.representation = match rt {
+                                                            RepresentationType::VanDerWaals => UIRepType::VanDerWaals,
+                                                            RepresentationType::BallAndStick => UIRepType::BallStick,
+                                                            RepresentationType::Ribbon => UIRepType::Ribbon,
+                                                            RepresentationType::Surface => UIRepType::Surface,
+                                                            _ => UIRepType::VanDerWaals,
+                                                        };
+                                                    }
+                                                    if do_reset {
+                                                        self.vr_mol_position = glam::Vec3::new(0.0, 1.4, -1.5);
+                                                        self.vr_mol_rotation = glam::Quat::IDENTITY;
+                                                        self.vr_mol_scale    = 0.002;
+                                                    }
+                                                    if do_scale_up   { self.vr_mol_scale = (self.vr_mol_scale * 1.5).min(0.05); }
+                                                    if do_scale_down { self.vr_mol_scale = (self.vr_mol_scale / 1.5).max(0.0003); }
+
+                                                    // Update egui textures
+                                                    for (id, delta) in &full_out.textures_delta.set {
+                                                        menu_rdr.update_texture(&renderer.device, &renderer.queue, *id, delta);
+                                                    }
+                                                    let prims = self.vr_egui_ctx.tessellate(full_out.shapes, px);
+                                                    let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [screen_w, screen_h], pixels_per_point: px };
+
+                                                    let mut menu_enc = renderer.device.create_command_encoder(
+                                                        &wgpu::CommandEncoderDescriptor { label: Some("VR Menu Enc") }
+                                                    );
+                                                    menu_rdr.update_buffers(&renderer.device, &renderer.queue, &mut menu_enc, &prims, &sd);
+                                                    {
+                                                        let mut rpass = menu_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                                            label: Some("VR Menu Pass"),
+                                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                                view: &vr.vr_menu_texture_view,
+                                                                resolve_target: None,
+                                                                ops: wgpu::Operations {
+                                                                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.08, g: 0.08, b: 0.12, a: 0.95 }),
+                                                                    store: wgpu::StoreOp::Store,
+                                                                },
+                                                            })],
+                                                            depth_stencil_attachment: None,
+                                                            timestamp_writes: None,
+                                                            occlusion_query_set: None,
+                                                        }).forget_lifetime();
+                                                        menu_rdr.render(&mut rpass, &prims, &sd);
+                                                    }
+                                                    renderer.queue.submit(std::iter::once(menu_enc.finish()));
+
+                                                    // Upload menu quad transform to GPU
+                                                    let menu_world = glam::Mat4::from_scale_rotation_translation(
+                                                        glam::Vec3::new(0.6, 0.3, 1.0), // 60 cm × 30 cm
+                                                        glam::Quat::IDENTITY,
+                                                        glam::Vec3::new(0.0, 1.4, -0.8),
+                                                    );
+                                                    vr.update_menu_transform(&renderer.queue, menu_world);
+
+                                                    for id in &full_out.textures_delta.free {
+                                                        menu_rdr.free_texture(id);
+                                                    }
+                                                }
                                             }
 
                                             // Acquire swapchain images
@@ -1119,6 +1332,8 @@ impl ApplicationHandler for App {
                                                 let mut vr_enc = renderer.device.create_command_encoder(
                                                     &wgpu::CommandEncoderDescriptor { label: Some("VR Encoder") }
                                                 );
+
+                                                let menu_vis = self.vr_menu_visible;
 
                                                 // ── LEFT EYE ──────────────────────────────────────
                                                 {
@@ -1145,6 +1360,7 @@ impl ApplicationHandler for App {
                                                     if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
                                                         vr_sph.render(&mut pass);
                                                     }
+                                                    if menu_vis { vr.render_menu_quad(&mut pass, &vr.left_camera_bind_group); }
                                                 }
 
                                                 // ── RIGHT EYE ─────────────────────────────────────
@@ -1172,6 +1388,7 @@ impl ApplicationHandler for App {
                                                     if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
                                                         vr_sph.render(&mut pass);
                                                     }
+                                                    if menu_vis { vr.render_menu_quad(&mut pass, &vr.right_camera_bind_group); }
                                                 }
 
                                                 renderer.queue.submit(std::iter::once(vr_enc.finish()));

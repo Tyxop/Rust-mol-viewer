@@ -9,6 +9,18 @@ use glam::{Mat4, Quat, Vec3, Vec4};
 use log::{info, warn};
 use mol_vr::{openxr, VrPerformanceMonitor, VrSession};
 use wgpu;
+use wgpu::util::DeviceExt;
+
+/// Temporary bundle used while constructing the menu panel resources.
+struct MenuResources {
+    texture: wgpu::Texture,
+    texture_view: wgpu::TextureView,
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    transform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
 
 /// VR renderer with stereo support
 pub struct VrRenderer {
@@ -33,6 +45,18 @@ pub struct VrRenderer {
     // Performance monitoring
     performance_monitor: VrPerformanceMonitor,
     last_warning_frame: usize,
+
+    // ── Floating VR menu panel ────────────────────────────────────────────
+    // Offscreen texture where egui draws the menu (Rgba8Unorm, 512×256).
+    // A quad pipeline samples this texture and draws it into each eye pass.
+    pub vr_menu_texture: wgpu::Texture,
+    pub vr_menu_texture_view: wgpu::TextureView,
+    vr_menu_pipeline: wgpu::RenderPipeline,
+    vr_menu_vertex_buffer: wgpu::Buffer,
+    vr_menu_index_buffer: wgpu::Buffer,
+    /// GPU buffer for the 4×4 world-space transform of the menu quad.
+    pub vr_menu_transform_buffer: wgpu::Buffer,
+    vr_menu_bind_group: wgpu::BindGroup,
 }
 
 impl VrRenderer {
@@ -118,6 +142,9 @@ impl VrRenderer {
 
         info!("VR renderer initialized successfully");
 
+        // ── Build floating menu panel resources ───────────────────────────
+        let menu = Self::create_menu_resources(device, camera_bind_group_layout, swapchain_format);
+
         Ok(Self {
             vr_session,
             swapchain_format,
@@ -131,7 +158,199 @@ impl VrRenderer {
             right_camera_bind_group,
             performance_monitor: VrPerformanceMonitor::new(),
             last_warning_frame: 0,
+            vr_menu_texture: menu.texture,
+            vr_menu_texture_view: menu.texture_view,
+            vr_menu_pipeline: menu.pipeline,
+            vr_menu_vertex_buffer: menu.vertex_buffer,
+            vr_menu_index_buffer: menu.index_buffer,
+            vr_menu_transform_buffer: menu.transform_buffer,
+            vr_menu_bind_group: menu.bind_group,
         })
+    }
+
+    // ── Menu panel creation ───────────────────────────────────────────────
+
+    fn create_menu_resources(
+        device: &wgpu::Device,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        swapchain_format: wgpu::TextureFormat,
+    ) -> MenuResources {
+        const W: u32 = 512;
+        const H: u32 = 256;
+
+        // Offscreen texture: egui draws the menu here
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("VR Menu Texture"),
+            size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Sampler for the menu texture
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("VR Menu Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // Transform buffer (mat4 in stage space)
+        let transform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("VR Menu Transform"),
+            size: 64, // mat4x4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Bind group layout for the panel (set 1): transform + texture + sampler
+        let panel_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VR Menu Panel BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("VR Menu Bind Group"),
+            layout: &panel_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: transform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
+        // Shader (reuse ui_quad.wgsl)
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VR Menu Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/ui_quad.wgsl").into(),
+            ),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("VR Menu Pipeline Layout"),
+            bind_group_layouts: &[camera_bind_group_layout, &panel_bgl],
+            push_constant_ranges: &[],
+        });
+
+        // Pipeline renders the menu quad INTO the VR swapchain (must match swapchain_format)
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VR Menu Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 20, // 3×f32 pos + 2×f32 uv
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0,  shader_location: 0 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 12, shader_location: 1 },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: swapchain_format, // must match VR swapchain
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None, // visible from both sides
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false, // transparent UI, don't write depth
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Unit quad vertices (local space ±0.5); world scale applied via transform
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct QV { pos: [f32; 3], uv: [f32; 2] }
+        let verts: [QV; 4] = [
+            QV { pos: [-0.5,  0.5, 0.0], uv: [0.0, 0.0] },
+            QV { pos: [ 0.5,  0.5, 0.0], uv: [1.0, 0.0] },
+            QV { pos: [ 0.5, -0.5, 0.0], uv: [1.0, 1.0] },
+            QV { pos: [-0.5, -0.5, 0.0], uv: [0.0, 1.0] },
+        ];
+        let idxs: [u16; 6] = [0, 1, 2, 0, 2, 3];
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("VR Menu VB"), contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("VR Menu IB"), contents: bytemuck::cast_slice(&idxs),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        MenuResources { texture, texture_view, pipeline, vertex_buffer, index_buffer, transform_buffer, bind_group }
+    }
+
+    /// Write the menu quad's world-space transform (Mat4, stage-space meters) to GPU.
+    /// Call once per frame when the menu world position changes.
+    pub fn update_menu_transform(&self, queue: &wgpu::Queue, world_mat: Mat4) {
+        queue.write_buffer(&self.vr_menu_transform_buffer, 0, bytemuck::cast_slice(&world_mat.to_cols_array()));
+    }
+
+    /// Render the floating menu quad into a VR eye render pass.
+    /// `camera_bg` must be the per-eye camera bind group (set 0).
+    pub fn render_menu_quad<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera_bg: &'a wgpu::BindGroup,
+    ) {
+        pass.set_pipeline(&self.vr_menu_pipeline);
+        pass.set_bind_group(0, camera_bg, &[]);
+        pass.set_bind_group(1, &self.vr_menu_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vr_menu_vertex_buffer.slice(..));
+        pass.set_index_buffer(self.vr_menu_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..6, 0, 0..1);
     }
 
     /// Create a depth texture for VR rendering
