@@ -173,7 +173,38 @@ python -m openmm.testInstallation
 
 ---
 
-### Live Streaming — `scripts/openmm_mdss.py`
+### Simulation + Audit — `scripts/openmm_mdss.py`
+
+The script has a built-in pipeline (audit → prepare → FF selection → equilibrate → production). Two ways to run it:
+
+**Option A — script launches the viewer automatically:**
+```bash
+python scripts/openmm_mdss.py 9PZW.pdb --launch-viewer --viewer-exe target/release/mol-app
+```
+
+**Option B — open the viewer manually first, then run the script:**
+```bash
+# Terminal 1: open viewer in streaming mode
+cargo run --package mol-app --release -- --live-stream 7777 9PZW.pdb
+
+# Terminal 2: run simulation (audits the molecule automatically before simulating)
+python scripts/openmm_mdss.py 9PZW.pdb --port 7777
+```
+
+If the audit finds blocking issues (NaN coordinates, etc.) the script exits before simulating.
+
+#### CLI options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `pdb` | — | PDB file to simulate (same file passed to the viewer) |
+| `--port N` | `7777` | MDSS TCP port |
+| `--launch-viewer` | off | Launch the viewer as a subprocess automatically |
+| `--viewer-exe PATH` | `mol-app` | Path to the viewer executable |
+
+---
+
+### Live Streaming API — `MDSSReporter`
 
 `MDSSReporter` is an OpenMM reporter that streams atom coordinates to PDB Visual in real time over TCP using the MDSS protocol. Every N integration steps, positions are sent to the viewer and rendered immediately.
 
