@@ -75,6 +75,7 @@ struct App {
     mouse_pressed: bool,
     right_mouse_pressed: bool,
     mouse_down_pos: Option<(f64, f64)>,
+    mouse_down_in_egui: bool,  // true if the current press started over an egui widget
 
     // Keyboard modifiers for selection
     ctrl_pressed: bool,
@@ -124,6 +125,7 @@ impl App {
             mouse_pressed: false,
             right_mouse_pressed: false,
             mouse_down_pos: None,
+            mouse_down_in_egui: false,
             ctrl_pressed: false,
             shift_pressed: false,
             egui_ctx: None,
@@ -1520,7 +1522,8 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Update camera and render 3D scene
+                    // Upload camera matrix to GPU every frame
+                    renderer.update();
 
                     match renderer.surface.get_current_texture() {
                         Ok(output) => {
@@ -1750,41 +1753,53 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                // Only handle mouse input if egui didn't consume it
-                if !egui_consumed_event && !self.egui_wants_pointer {
-                    match button {
-                        MouseButton::Left => {
-                            if state == ElementState::Pressed {
-                                self.mouse_pressed = true;
-                                // Record mouse down position for click detection
-                                self.mouse_down_pos = self.last_mouse_pos;
-                            } else {
-                                self.mouse_pressed = false;
+                log::info!("MouseInput: button={:?} state={:?} egui_consumed={} egui_wants={} mouse_pressed={}", button, state, egui_consumed_event, self.egui_wants_pointer, self.mouse_pressed);
+                match button {
+                    MouseButton::Left => {
+                        if state == ElementState::Pressed {
+                            // Always register drag start regardless of egui.
+                            // Rotation only fires in CursorMoved — egui panels don't need
+                            // to intercept the press to work; they respond to the release/click.
+                            self.mouse_pressed = true;
+                            self.mouse_down_pos = self.last_mouse_pos;
+                            // Track whether this press started inside egui (for selection gating)
+                            self.mouse_down_in_egui = egui_consumed_event;
+                        } else {
+                            self.mouse_pressed = false;
 
-                                // Check if this was a click (mouse up at same position as mouse down)
+                            // Only do atom selection if click was NOT in egui
+                            if !self.mouse_down_in_egui {
                                 if let (Some(down_pos), Some(up_pos)) = (self.mouse_down_pos, self.last_mouse_pos) {
                                     let dist = ((up_pos.0 - down_pos.0).powi(2) + (up_pos.1 - down_pos.1).powi(2)).sqrt();
-
-                                    // If mouse moved less than 5 pixels, consider it a click
                                     if dist < 5.0 && self.ctrl_pressed {
                                         self.handle_selection_click(up_pos.0 as f32, up_pos.1 as f32);
                                     }
                                 }
-
-                                self.mouse_down_pos = None;
                             }
+
+                            self.mouse_down_pos = None;
+                            self.mouse_down_in_egui = false;
                         }
-                        MouseButton::Right => {
-                            self.right_mouse_pressed = state == ElementState::Pressed;
-                        }
-                        _ => {}
                     }
+                    MouseButton::Right => {
+                        self.right_mouse_pressed = state == ElementState::Pressed;
+                    }
+                    _ => {}
                 }
             },
 
             WindowEvent::CursorMoved { position, .. } => {
-                // Only handle cursor movement for camera if egui doesn't want the pointer
-                if !self.egui_wants_pointer {
+                // Allow camera movement if:
+                // - A drag started outside egui (mouse_down_in_egui = false), OR
+                // - Right mouse button drag (pan), OR
+                // - No mouse button pressed but cursor is in 3D area
+                let allow_camera = (self.mouse_pressed && !self.mouse_down_in_egui)
+                    || self.right_mouse_pressed
+                    || (!self.mouse_pressed && !self.egui_wants_pointer);
+                if self.mouse_pressed || self.right_mouse_pressed {
+                    log::info!("CursorMoved: mouse_pressed={} in_egui={} allow={}", self.mouse_pressed, self.mouse_down_in_egui, allow_camera);
+                }
+                if allow_camera {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta_x = position.x - last_pos.0;
                         let delta_y = position.y - last_pos.1;
@@ -1811,8 +1826,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // Only handle mouse wheel if egui didn't consume it
-                if !egui_consumed_event && !self.egui_wants_pointer {
+                // Use egui_consumed_event (fresh) — same fix as MouseInput
+                if !egui_consumed_event {
                     if let Some(renderer) = &mut self.renderer {
                         let scroll_amount = match delta {
                             MouseScrollDelta::LineDelta(_, y) => y * 5.0,

@@ -23,10 +23,16 @@ struct AtomDataGPU {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GridParamsGPU {
-    origin: [f32; 3],
-    spacing: f32,
-    dimensions: [u32; 3],  // nx, ny, nz
+    // SDF voxel grid
+    sdf_origin: [f32; 3],
+    sdf_spacing: f32,
+    sdf_dimensions: [u32; 3],
     probe_radius: f32,
+    // Spatial acceleration grid
+    spatial_origin: [f32; 3],
+    spatial_cell_size: f32,
+    spatial_dims: [u32; 3],
+    _pad: u32,
 }
 
 #[derive(Clone)]
@@ -199,11 +205,7 @@ impl SurfaceRenderer {
     fn init_compute_pipeline(
         device: &wgpu::Device,
     ) -> (Option<wgpu::ComputePipeline>, Option<wgpu::BindGroupLayout>, bool) {
-        // Check if device supports compute shaders
-        let features = device.features();
-        if !features.contains(wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY) {
-            return (None, None, false);
-        }
+        // Storage buffers + compute shaders are part of base wgpu/Vulkan/DX12 — no special feature needed
 
         // Load compute shader
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -218,7 +220,7 @@ impl SurfaceRenderer {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Surface SDF Compute Bind Group Layout"),
                 entries: &[
-                    // Binding 0: Atom data (storage buffer, read-only)
+                    // Binding 0: Atoms sorted by spatial cell (storage, read-only)
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -229,7 +231,7 @@ impl SurfaceRenderer {
                         },
                         count: None,
                     },
-                    // Binding 1: Grid params (uniform buffer)
+                    // Binding 1: Grid params (uniform)
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -240,12 +242,34 @@ impl SurfaceRenderer {
                         },
                         count: None,
                     },
-                    // Binding 2: SDF values (storage buffer, read-write)
+                    // Binding 2: SDF output (storage, read-write)
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 3: Spatial cell start indices (storage, read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 4: Spatial cell atom counts (storage, read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -274,7 +298,8 @@ impl SurfaceRenderer {
         (Some(compute_pipeline), Some(compute_bind_group_layout), true)
     }
 
-    /// Compute SDF values on GPU using compute shader
+    /// Compute SDF values on GPU using compute shader with spatial grid acceleration.
+    /// Complexity: O(V × K) where K ≈ 27 cells × atoms_per_cell (constant), vs O(V × A) brute force.
     fn compute_sdf_gpu(
         &self,
         device: &wgpu::Device,
@@ -289,31 +314,84 @@ impl SurfaceRenderer {
         };
 
         let (nx, ny, nz) = grid.dimensions;
-        let total_voxels = (nx * ny * nz) as usize;
+        let total_voxels = nx * ny * nz;
 
-        // Prepare atom data for GPU
-        let atom_data: Vec<AtomDataGPU> = protein
+        // --- Build spatial acceleration grid ---
+        // Cell size = max possible expanded radius (max VdW ~2.0 Å + probe) + epsilon
+        // Any atom influencing a voxel must be in the same or adjacent cell.
+        let spatial_cell_size = 2.0f32 + config.probe_radius + 0.1;
+        let spatial_origin = grid.origin;
+
+        // Spatial grid covers the same extent as the SDF grid
+        let extent = Vec3::new(
+            nx as f32 * grid.spacing,
+            ny as f32 * grid.spacing,
+            nz as f32 * grid.spacing,
+        );
+        let spatial_nx = ((extent.x / spatial_cell_size).ceil() as u32).max(1);
+        let spatial_ny = ((extent.y / spatial_cell_size).ceil() as u32).max(1);
+        let spatial_nz = ((extent.z / spatial_cell_size).ceil() as u32).max(1);
+        let total_spatial_cells = (spatial_nx * spatial_ny * spatial_nz) as usize;
+
+        log::debug!(
+            "Spatial grid: {}×{}×{} cells ({} total), cell_size={:.2}Å",
+            spatial_nx, spatial_ny, spatial_nz, total_spatial_cells, spatial_cell_size
+        );
+
+        // Assign each atom to a spatial cell and sort
+        let mut atom_cell_pairs: Vec<(u32, AtomDataGPU)> = protein
             .atoms
             .iter()
-            .map(|atom| AtomDataGPU {
-                position: atom.position.into(),
-                radius: atom.element.vdw_radius(),
+            .map(|atom| {
+                let rel = atom.position - spatial_origin;
+                let cx = ((rel.x / spatial_cell_size) as u32).min(spatial_nx - 1);
+                let cy = ((rel.y / spatial_cell_size) as u32).min(spatial_ny - 1);
+                let cz = ((rel.z / spatial_cell_size) as u32).min(spatial_nz - 1);
+                let cell_idx = cx + cy * spatial_nx + cz * spatial_nx * spatial_ny;
+                (cell_idx, AtomDataGPU {
+                    position: atom.position.into(),
+                    radius: atom.element.vdw_radius(),
+                })
             })
             .collect();
 
-        // Create atom data buffer
+        atom_cell_pairs.sort_unstable_by_key(|(c, _)| *c);
+
+        let sorted_atoms: Vec<AtomDataGPU> = atom_cell_pairs.iter().map(|(_, a)| *a).collect();
+
+        // Build cell_starts (0xFFFF_FFFF = empty) and cell_counts
+        let mut cell_starts = vec![0xFFFF_FFFFu32; total_spatial_cells];
+        let mut cell_counts = vec![0u32; total_spatial_cells];
+
+        let mut i = 0;
+        while i < atom_cell_pairs.len() {
+            let cell = atom_cell_pairs[i].0 as usize;
+            cell_starts[cell] = i as u32;
+            let mut j = i;
+            while j < atom_cell_pairs.len() && atom_cell_pairs[j].0 as usize == cell {
+                j += 1;
+            }
+            cell_counts[cell] = (j - i) as u32;
+            i = j;
+        }
+
+        // --- Upload to GPU ---
+
         let atom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SDF Atom Data Buffer"),
-            contents: bytemuck::cast_slice(&atom_data),
+            label: Some("SDF Atoms Sorted Buffer"),
+            contents: bytemuck::cast_slice(&sorted_atoms),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        // Create grid params buffer
         let grid_params = GridParamsGPU {
-            origin: grid.origin.into(),
-            spacing: grid.spacing,
-            dimensions: [nx as u32, ny as u32, nz as u32],
+            sdf_origin: grid.origin.into(),
+            sdf_spacing: grid.spacing,
+            sdf_dimensions: [nx as u32, ny as u32, nz as u32],
             probe_radius: config.probe_radius,
+            spatial_origin: spatial_origin.into(),
+            spatial_cell_size,
+            spatial_dims: [spatial_nx, spatial_ny, spatial_nz],
+            _pad: 0,
         };
 
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -322,7 +400,6 @@ impl SurfaceRenderer {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        // Create SDF values buffer (output)
         let sdf_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("SDF Values Buffer"),
             size: (total_voxels * std::mem::size_of::<f32>()) as u64,
@@ -330,7 +407,6 @@ impl SurfaceRenderer {
             mapped_at_creation: false,
         });
 
-        // Create staging buffer for readback
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("SDF Staging Buffer"),
             size: (total_voxels * std::mem::size_of::<f32>()) as u64,
@@ -338,27 +414,31 @@ impl SurfaceRenderer {
             mapped_at_creation: false,
         });
 
-        // Create bind group
+        let cell_starts_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SDF Cell Starts Buffer"),
+            contents: bytemuck::cast_slice(&cell_starts),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let cell_counts_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SDF Cell Counts Buffer"),
+            contents: bytemuck::cast_slice(&cell_counts),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SDF Compute Bind Group"),
             layout: compute_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: atom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: sdf_buffer.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: atom_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sdf_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cell_starts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
             ],
         });
 
-        // Create command encoder and dispatch compute shader
+        // --- Dispatch ---
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("SDF Compute Encoder"),
         });
@@ -372,27 +452,22 @@ impl SurfaceRenderer {
             compute_pass.set_pipeline(compute_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
 
-            // Dispatch workgroups (8x8x8 threads per workgroup)
             let workgroups_x = ((nx + 7) / 8) as u32;
             let workgroups_y = ((ny + 7) / 8) as u32;
-            let workgroups_z = ((nz + 7) / 8) as u32;
+            let workgroups_z = ((nz + 3) / 4) as u32;  // workgroup z=4
 
-            log::debug!("Dispatching {} x {} x {} workgroups ({} total threads)",
-                workgroups_x, workgroups_y, workgroups_z, nx * ny * nz);
+            log::debug!("Dispatching {}×{}×{} workgroups ({} voxels total)",
+                workgroups_x, workgroups_y, workgroups_z, total_voxels);
 
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
         }
 
-        // Copy results to staging buffer
         encoder.copy_buffer_to_buffer(
-            &sdf_buffer,
-            0,
-            &staging_buffer,
-            0,
+            &sdf_buffer, 0,
+            &staging_buffer, 0,
             (total_voxels * std::mem::size_of::<f32>()) as u64,
         );
 
-        // Submit commands
         queue.submit(Some(encoder.finish()));
 
         // Read back results
@@ -402,17 +477,11 @@ impl SurfaceRenderer {
             sender.send(result).unwrap();
         });
 
-        // Wait for GPU to finish
         device.poll(wgpu::Maintain::Wait);
-
-        // Check mapping result
         receiver.recv().unwrap()?;
 
-        // Copy data
         let data = buffer_slice.get_mapped_range();
         let sdf_values: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-
-        // Cleanup
         drop(data);
         staging_buffer.unmap();
 
