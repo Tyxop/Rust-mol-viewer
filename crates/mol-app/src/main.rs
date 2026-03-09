@@ -1,4 +1,5 @@
 mod model_manager;
+mod live_source;
 
 use anyhow::Result;
 use model_manager::ModelManager;
@@ -26,6 +27,13 @@ struct App {
 
     // VR mode flag
     vr_mode: bool,
+
+    // ── Live source ────────────────────────────────────────────────────────
+    live_rx: Option<std::sync::mpsc::Receiver<(u32, Vec<glam::Vec3>)>>,
+    live_frame_interval_avg: f32,   // EMA of seconds between frames
+    live_last_frame_time: Option<std::time::Instant>,
+    live_mode_is_socket: bool,      // false=file watcher, true=socket
+    live_fps_warn_logged: bool,     // avoid log spam
 
     // ── VR molecule world transform (modified by controller input) ────────
     /// Molecule center in OpenXR stage space (meters). Default: 1.5 m ahead, 1.4 m up.
@@ -102,6 +110,11 @@ impl App {
             last_loaded_model_id: None,
             protein_path,
             vr_mode,
+            live_rx: None,
+            live_frame_interval_avg: 0.0,
+            live_last_frame_time: None,
+            live_mode_is_socket: false,
+            live_fps_warn_logged: false,
             vr_mol_position: glam::Vec3::new(0.0, 1.4, -1.5),
             vr_mol_rotation: glam::Quat::IDENTITY,
             vr_mol_scale: 0.002,
@@ -1044,6 +1057,43 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // ── Live source frame ingestion ─────────────────────────────────────────
+                    if let Some(ref rx) = self.live_rx {
+                        let mut latest: Option<Vec<glam::Vec3>> = None;
+                        let mut _latest_frame_num = 0u32;
+                        while let Ok((frame_num, coords)) = rx.try_recv() {
+                            // track frame rate
+                            let now = std::time::Instant::now();
+                            if let Some(prev) = self.live_last_frame_time {
+                                let dt = now.duration_since(prev).as_secs_f32();
+                                self.live_frame_interval_avg = 0.9 * self.live_frame_interval_avg + 0.1 * dt;
+                            }
+                            self.live_last_frame_time = Some(std::time::Instant::now());
+                            latest = Some(coords);
+                            _latest_frame_num = frame_num;
+                        }
+                        if let Some(coords) = latest {
+                            if let Some(model) = self.model_manager.visible_models().next() {
+                                renderer.update_atom_positions(&model.trajectory.topology, &coords);
+                            }
+                            // Auto-suggest: if file watcher is very fast, suggest socket mode
+                            if !self.live_mode_is_socket && !self.live_fps_warn_logged {
+                                let fps = 1.0 / self.live_frame_interval_avg.max(1e-6);
+                                if fps > 20.0 {
+                                    log::warn!("Live FPS {:.1} — for real-time streaming, use --live-stream <port> instead", fps);
+                                    self.live_fps_warn_logged = true;
+                                }
+                            }
+                            // Reset warn flag if FPS drops back below threshold
+                            if self.live_fps_warn_logged {
+                                let fps = 1.0 / self.live_frame_interval_avg.max(1e-6);
+                                if fps < 5.0 {
+                                    self.live_fps_warn_logged = false;
+                                }
+                            }
+                        }
+                    }
+
                     // ── VR Controller Input ──────────────────────────────────────────────
                     // Joysticks rotate/scale the molecule transform (mol_to_world).
                     // Left grip toggles the floating menu.
@@ -1753,7 +1803,6 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                log::info!("MouseInput: button={:?} state={:?} egui_consumed={} egui_wants={} mouse_pressed={}", button, state, egui_consumed_event, self.egui_wants_pointer, self.mouse_pressed);
                 match button {
                     MouseButton::Left => {
                         if state == ElementState::Pressed {
@@ -1796,9 +1845,6 @@ impl ApplicationHandler for App {
                 let allow_camera = (self.mouse_pressed && !self.mouse_down_in_egui)
                     || self.right_mouse_pressed
                     || (!self.mouse_pressed && !self.egui_wants_pointer);
-                if self.mouse_pressed || self.right_mouse_pressed {
-                    log::info!("CursorMoved: mouse_pressed={} in_egui={} allow={}", self.mouse_pressed, self.mouse_down_in_egui, allow_camera);
-                }
                 if allow_camera {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta_x = position.x - last_pos.0;
@@ -1921,7 +1967,15 @@ fn main() -> Result<()> {
     // Check for --vr flag
     let vr_flag = args.iter().any(|arg| arg == "--vr");
 
-    // Get protein path (skip --vr flags)
+    // Live source flags
+    let live_watch_path = args.windows(2)
+        .find(|w| w[0] == "--live-watch")
+        .map(|w| w[1].clone());
+    let live_stream_port: Option<u16> = args.windows(2)
+        .find(|w| w[0] == "--live-stream")
+        .and_then(|w| w[1].parse().ok());
+
+    // Get protein path (skip --vr flags and live-source flags)
     let protein_path = args.iter()
         .skip(1)
         .find(|arg| !arg.starts_with("--"))
@@ -1969,6 +2023,29 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new(protein_path, vr_mode);
+
+    // Start live source if requested
+    if let Some(port) = live_stream_port {
+        let (tx, rx) = std::sync::mpsc::channel();
+        live_source::print_python_client_example(port);
+        std::thread::Builder::new()
+            .name("live-stream-server".into())
+            .spawn(move || live_source::run_socket_server(tx, port))
+            .expect("failed to spawn socket server thread");
+        app.live_rx = Some(rx);
+        app.live_mode_is_socket = true;
+        log::info!("Live streaming: socket server started on port {}", port);
+    } else if let Some(path) = live_watch_path {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_clone = path.clone();
+        std::thread::Builder::new()
+            .name("live-file-watcher".into())
+            .spawn(move || live_source::run_file_watcher_robust(tx, path_clone, 100))
+            .expect("failed to spawn file watcher thread");
+        app.live_rx = Some(rx);
+        log::info!("Live watching DCD file: {}", path);
+    }
+
     event_loop.run_app(&mut app)?;
 
     Ok(())
