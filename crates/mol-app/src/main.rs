@@ -1975,11 +1975,27 @@ fn main() -> Result<()> {
         .find(|w| w[0] == "--live-stream")
         .and_then(|w| w[1].parse().ok());
 
-    // Get protein path (skip --vr flags and live-source flags)
-    let protein_path = args.iter()
-        .skip(1)
-        .find(|arg| !arg.starts_with("--"))
-        .cloned();
+    // Get protein path — skip flags (--xxx) and their values (the token after --xxx)
+    let protein_path = {
+        let mut skip_next = false;
+        let mut found: Option<String> = None;
+        for arg in args.iter().skip(1) {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg.starts_with("--") {
+                // flags that consume the next token as their value
+                if arg == "--live-stream" || arg == "--live-watch" {
+                    skip_next = true;
+                }
+                continue;
+            }
+            found = Some(arg.clone());
+            break;
+        }
+        found
+    };
 
     if protein_path.is_none() {
         log::warn!("No PDB file provided");
